@@ -56,6 +56,7 @@ public:
     return xyoffset;
   }
   int static get_star_pattern(int stencil_size, int n2d, int n3d, int nz) {
+    ASSERT2(nz > 0);
     //Not sure what the right number is here in 3d
     // the old number would be if nz > 1 correspond to
     // either
@@ -65,7 +66,7 @@ public:
     // where count3D was the number of cells in a stencil extended to 3d
     // e.g. a 5 point becoming 7 points
     // But this corresponds to "extruding" the stencil around the z direction
-    return stencil_size * (n2d + n3d * nz);
+    return (stencil_size / nz) * (n2d + n3d * nz);
   }
 };
 
@@ -293,10 +294,16 @@ int SNESSolver::init() {
                           .withDefault<int>(0);
       auto n_taxi = (*options)["stencil:taxi"]
                         .doc("Extent of stencil (taxi-cab norm)")
-                        .withDefault<int>(2);
+                        .withDefault<int>(0);
       auto n_cross = (*options)["stencil:cross"]
                          .doc("Extent of stencil (cross)")
                          .withDefault<int>(0);
+      //Set n_taxi 2 if nothig else is set
+      //TODO: Probably a better way to do this
+      if (n_square == 0 && n_taxi == 0 && n_cross == 0) {
+        output_info.write("Setting beuler:stencil:taxi = 2\n");
+        n_taxi = 2;
+      }
 
       auto const xyoffsets =
           ColoringStencil::get_offsets(n_square, n_taxi, n_cross, mesh->LocalNz);
@@ -412,8 +419,6 @@ int SNESSolver::init() {
       // Mark non-zero entries
 
       output_progress.write("Marking non-zero Jacobian entries\n");
-      int rank;
-      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
       PetscScalar val = 1.0;
       for (int x = mesh->xstart; x <= mesh->xend; x++) {
         for (int y = mesh->ystart; y <= mesh->yend; y++) {
@@ -446,7 +451,6 @@ int SNESSolver::init() {
               }
             }
           }
-
           // 3D fields
           for (int z = 0; z < mesh->LocalNz; z++) {
             int ind = ROUND(index(x, y, z));
@@ -468,7 +472,8 @@ int SNESSolver::init() {
               for (const auto& [x_off, y_off, z_off] : xyoffsets) {
                 int xi = x + x_off;
                 int yi = y + y_off;
-                int zi = z + z_off;
+                //int zi = (z + z_off);
+                int zi = z_off;
 
                 if ((xi < 0) || (yi < 0) || (xi >= mesh->LocalNx)
                     || (yi >= mesh->LocalNy)) {
@@ -488,10 +493,9 @@ int SNESSolver::init() {
                 for (int j = 0; j < n3d; j++) {
                   PetscInt col = ind2 + j;
                   ierr = MatSetValues(Jmf, 1, &row, 1, &col, &val, INSERT_VALUES);
-
                   if (ierr != 0) {
-                    output.write("ERROR: {} : ({}, {}) -> ({}, {}) : {} -> {}\n", row, x,
-                                 y, xi, yi, ind2, ind2 + n3d - 1);
+                    output.write("ERROR: {} {} : ({}, {}) -> ({}, {}) : {} -> {}\n", row,
+                                 x, y, xi, yi, ind2, ind2 + n3d - 1);
                   }
                   CHKERRQ(ierr);
                 }

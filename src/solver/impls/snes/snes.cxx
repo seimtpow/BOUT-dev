@@ -35,20 +35,21 @@ private:
   }
 
 public:
-  //allocated and returns vector of offsets in stencil
-  auto static get_offsets(int n_compact, int n_taxi, int n_cross) {
+  auto static get_offsets(int n_compact, int n_taxi, int n_cross, int nz) {
     ASSERT2(n_compact >= 0 && n_cross >= 0 && n_taxi >= 0
             && n_compact + n_cross + n_taxi > 0);
     auto inside = [&](int i, int j) {
       return in_compact(i, j, n_compact) || in_taxi(i, j, n_taxi)
              || in_cross(i, j, n_cross);
     };
-    std::vector<std::pair<int, int>> xyoffset;
+    std::vector<std::tuple<int, int, int>> xyoffset;
     auto loop_bound = std::max({n_compact, n_taxi, n_cross});
     for (int i = -loop_bound; i <= loop_bound; ++i) {
       for (int j = -loop_bound; j <= loop_bound; ++j) {
         if (inside(i, j)) {
-          xyoffset.emplace_back(i, j);
+          for (int z = 0; z < nz; ++z) {
+            xyoffset.emplace_back(i, j, z);
+          }
         }
       }
     }
@@ -297,7 +298,8 @@ int SNESSolver::init() {
                          .doc("Extent of stencil (cross)")
                          .withDefault<int>(0);
 
-      auto const xyoffsets = ColoringStencil::get_offsets(n_square, n_taxi, n_cross);
+      auto const xyoffsets =
+          ColoringStencil::get_offsets(n_square, n_taxi, n_cross, mesh->LocalNz);
 
       auto const star_pattern =
           ColoringStencil::get_star_pattern(xyoffsets.size(), n2d, n3d, mesh->LocalNz);
@@ -327,9 +329,9 @@ int SNESSolver::init() {
           //2D fields
           for (int i = 0; i < n2d; ++i) {
             int row = ind0 + i;
-            for (auto const& off : xyoffsets) {
-              int xi = x + off.first;
-              int yi = y + off.second;
+            for (auto const& [x_off, y_off, _] : xyoffsets) {
+              int xi = x + x_off;
+              int yi = y + y_off;
               if (xi < mesh->xstart) {
                 d_nnz[row] -= n2d;
                 if (!mesh->firstX()) {
@@ -357,9 +359,9 @@ int SNESSolver::init() {
             int ind = ROUND(index(x, y, z));
             for (int i = 0; i < n3d; ++i) {
               int row = ind + i + ((z == 0) ? n2d : 0);
-              for (auto const& off : xyoffsets) {
-                int xi = x + off.first;
-                int yi = y + off.second;
+              for (auto const& [x_off, y_off, _] : xyoffsets) {
+                int xi = x + x_off;
+                int yi = y + y_off;
                 if (xi < mesh->xstart) {
                   d_nnz[row] -= n3d;
                   if (!mesh->firstX()) {
@@ -410,7 +412,8 @@ int SNESSolver::init() {
       // Mark non-zero entries
 
       output_progress.write("Marking non-zero Jacobian entries\n");
-
+      int rank;
+      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
       PetscScalar val = 1.0;
       for (int x = mesh->xstart; x <= mesh->xend; x++) {
         for (int y = mesh->ystart; y <= mesh->yend; y++) {
@@ -422,17 +425,15 @@ int SNESSolver::init() {
             PetscInt row = ind0 + i;
 
             // Loop through each point in the stencil
-            for (const auto& xyoffset : xyoffsets) {
-              int xi = x + xyoffset.first;
-              int yi = y + xyoffset.second;
-
+            for (const auto& [x_off, y_off, _] : xyoffsets) {
+              int xi = x + x_off;
+              int yi = y + y_off;
               if ((xi < 0) || (yi < 0) || (xi >= mesh->LocalNx)
                   || (yi >= mesh->LocalNy)) {
                 continue;
               }
 
               int ind2 = ROUND(index(xi, yi, 0));
-
               if (ind2 < 0) {
                 continue; // A boundary point
               }
@@ -448,7 +449,6 @@ int SNESSolver::init() {
 
           // 3D fields
           for (int z = 0; z < mesh->LocalNz; z++) {
-
             int ind = ROUND(index(x, y, z));
 
             for (int i = 0; i < n3d; i++) {
@@ -465,16 +465,17 @@ int SNESSolver::init() {
               }
 
               // Star pattern
-              for (const auto& xyoffset : xyoffsets) {
-                int xi = x + xyoffset.first;
-                int yi = y + xyoffset.second;
+              for (const auto& [x_off, y_off, z_off] : xyoffsets) {
+                int xi = x + x_off;
+                int yi = y + y_off;
+                int zi = z + z_off;
 
                 if ((xi < 0) || (yi < 0) || (xi >= mesh->LocalNx)
                     || (yi >= mesh->LocalNy)) {
                   continue;
                 }
 
-                int ind2 = ROUND(index(xi, yi, z));
+                int ind2 = ROUND(index(xi, yi, zi));
                 if (ind2 < 0) {
                   continue; // Boundary point
                 }
@@ -492,35 +493,6 @@ int SNESSolver::init() {
                     output.write("ERROR: {} : ({}, {}) -> ({}, {}) : {} -> {}\n", row, x,
                                  y, xi, yi, ind2, ind2 + n3d - 1);
                   }
-                  CHKERRQ(ierr);
-                }
-              }
-
-              //TODO: what is this loop for?
-              int nz = mesh->LocalNz;
-              if (nz > 1) {
-                // Multiple points in z
-
-                int zp = (z + 1) % nz;
-
-                int ind2 = ROUND(index(x, y, zp));
-                if (zp == 0) {
-                  ind2 += n2d;
-                }
-                for (int j = 0; j < n3d; j++) {
-                  PetscInt col = ind2 + j;
-                  ierr = MatSetValues(Jmf, 1, &row, 1, &col, &val, INSERT_VALUES);
-                  CHKERRQ(ierr);
-                }
-
-                int zm = (z - 1 + nz) % nz;
-                ind2 = ROUND(index(x, y, zm));
-                if (zm == 0) {
-                  ind2 += n2d;
-                }
-                for (int j = 0; j < n3d; j++) {
-                  PetscInt col = ind2 + j;
-                  ierr = MatSetValues(Jmf, 1, &row, 1, &col, &val, INSERT_VALUES);
                   CHKERRQ(ierr);
                 }
               }
